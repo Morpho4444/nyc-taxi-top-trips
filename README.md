@@ -39,8 +39,9 @@ day one, and the assumption I made for each if they hadn't replied:
 | Which files count as "any of the parquet files you can find"? | **Last 12 published months** (configurable). Easy to widen to all of 2009→today via `config.yaml` or `--months`. |
 | What does "give me all the trips" mean — full rows, IDs, aggregates? | **Full original rows**, partitioned by month. A small `summary.parquet` gives per-month threshold and counts at a glance. |
 | Strict `>` or inclusive `>=`? | **Strict `>`** ("over 0.9 percentile"). |
+| Continuous (interpolated) or discrete (nearest-rank) percentile? | **Continuous**, via DuckDB's `quantile_cont`. If the client wants the nearest actual data point instead, swapping to `quantile_disc` is a one-line change. |
 | Should bad data (zero/negative distance, impossible distances) be cleaned? | **Left untouched.** The task is purely about distance ranking. A 269,097-mile trip survived in Jan 2026 — see Sample run. |
-| One unified schema across years, or preserve each file's columns? | **Preserved per partition.** TLC's schema changes over time; forcing a union loses information and isn't needed for the ask. |
+| One unified schema across years, or preserve each file's columns? | **Per-month**. Each month's output is readable independently; I don't promise a single unioned dataset across all years. TLC's schema changes over time (e.g. `cbd_congestion_fee` was added in 2025), so a forced union would lose columns. |
 
 ## How it works
 
@@ -81,9 +82,17 @@ but add reproducibility cost without measurable benefit at this data size.
 **Idempotency.** Each partition writes `part.parquet` + `_stats.parquet`. If
 both exist, the month is skipped on re-runs. Use `--force` to reprocess.
 
-**Missing or unpublished months.** TLC's publishing lag varies (I observed
-5–6 months at time of testing, not the 2 months I initially assumed). HTTP
-403/404 responses are logged as warnings and skipped; the loop continues.
+**Sidecar naming.** `_stats.parquet` uses the leading-underscore convention
+that Spark, Hive, and DuckDB's partitioned-dataset readers treat as hidden
+metadata, so it's skipped when something reads `output/top_trips/` as a
+partitioned dataset. A naive `**/*.parquet` glob would still pick it up — if
+that matters, separating into `output/stats/year_month=.../part.parquet` is
+a cleaner alternative (listed under Known limitations).
+
+**Missing or unpublished months.** TLC typically publishes monthly with about
+a 2-month delay. The pipeline handles any unavailable month — whether due to
+publishing lag, transient CloudFront errors, or other I/O failures — by
+logging a warning and continuing with the next month rather than crashing.
 
 ## Sample run
 
@@ -106,17 +115,17 @@ Run on May 17, 2026, default config (last 12 months):
 
 **Observations:**
 
-- Per-month p90 is stable at **8.3–9.5 miles** all year — roughly the
-  distance from Manhattan to JFK/LGA, consistent with the long tail being
-  airport runs.
+- Per-month p90 is stable at **8.3–9.5 miles** all year — consistent with a
+  long tail of airport or cross-borough trips.
 - August has the highest threshold (9.50 mi); worth investigating whether
   this is seasonal travel or a data artifact.
 - Filtered count is ~10% of total every month, as expected for strict `>p90`.
 - Total output: ~126 MB across 12 months.
 - **Data quality.** The maximum recorded `trip_distance` in Jan 2026 is
-  **269,097.48 miles** — about ten times Earth's circumference. Clearly a
-  sensor or data-entry error. Preserved in the output by design, since the
-  task is "trips over the 0.9 percentile of recorded distance," not "of
+  **269,097.48 miles** — about ten times Earth's circumference. Almost
+  certainly a data-quality issue (TLC explicitly notes it does not guarantee
+  the accuracy of these records). Preserved in the output by design, since
+  the task is "trips over the 0.9 percentile of recorded distance," not "of
   cleaned distance." A `--clean` flag would be a one-day add.
 
 ## Output format
@@ -190,14 +199,19 @@ Each is a deliberate scope decision for the MVP, and each is a 1-day add:
 - **Local cache.** Source files are streamed from CloudFront on every run.
   A `data/raw/` cache would make re-runs instant; skipped because streaming
   is already fast (~2–3s per file).
+- **Alternative output layout.** Stats currently live as `_stats.parquet`
+  sidecars next to `part.parquet` (underscore is a partition-metadata
+  convention that most tools skip). Cleaner alternative: split into
+  `output/top_trips/year_month=.../part.parquet` and
+  `output/stats/year_month=.../part.parquet`. Either works; I picked the
+  sidecar layout for the simpler glob in `build_summary`.
 - **Cross-month parallelism.** DuckDB already parallelizes within a file;
   cross-month parallelism would help on slow networks but matters less on
   fast ones.
 - **Data-quality cleaning.** A `--clean` flag with configurable rules (cap
   distance, drop non-positive, sanity-check timestamps).
-- **Schema-drift unification.** A unified cross-year output table would need
-  a column-projection step (TLC added `cbd_congestion_fee` in 2025, for
-  example).
+- **Schema-drift unification.** A unified cross-year output table would
+  need a column-projection step (TLC added `cbd_congestion_fee` in 2025).
 - **S3/GCS sink.** Output is local; remote sinks would need DuckDB's S3
   credentials and a small path change.
 - **Other taxi types.** Green works out of the box (`--taxi-color green`).
