@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: taxi-top-trips
+Version: 0.1.0
+Summary: Extract top-distance trips from NYC TLC parquet files.
+Requires-Python: >=3.10
+Requires-Dist: duckdb>=1.0
+Requires-Dist: pyyaml>=6.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pandas>=2.0; extra == "dev"
+Requires-Dist: pyarrow>=15.0; extra == "dev"
+Requires-Dist: numpy>=1.24; extra == "dev"

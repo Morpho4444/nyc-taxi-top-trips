@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taxi-top-trips"
+version = "0.1.0"
+description = "Extract top-distance trips from NYC TLC parquet files."
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.0",
+    "pyyaml>=6.0",
+]
+
+authors = [{name = "Eduardo Chavez", email = "edchavezmx@gmail.com"}]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pandas>=2.0",
+    "pyarrow>=15.0",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+taxi-top-trips = "taxi_top_trips.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

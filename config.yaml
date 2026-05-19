@@ -1,0 +1,13 @@
+# Default configuration for the pipeline.
+# Anything here can be overridden by CLI flags (see `python -m taxi_top_trips --help`).
+
+# Months to process. If omitted or empty, defaults to the last 12
+# likely-published months (today minus 2 months for TLC's publishing lag).
+# months:
+#   - 2024-01
+#   - 2024-02
+
+percentile: 0.9
+taxi_color: yellow
+output_dir: output
+force: false

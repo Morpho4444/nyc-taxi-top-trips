@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+src/taxi_top_trips/__init__.py
+src/taxi_top_trips/__main__.py
+src/taxi_top_trips/config.py
+src/taxi_top_trips/main.py
+src/taxi_top_trips/pipeline.py
+src/taxi_top_trips/urls.py
+src/taxi_top_trips.egg-info/PKG-INFO
+src/taxi_top_trips.egg-info/SOURCES.txt
+src/taxi_top_trips.egg-info/dependency_links.txt
+src/taxi_top_trips.egg-info/entry_points.txt
+src/taxi_top_trips.egg-info/requires.txt
+src/taxi_top_trips.egg-info/top_level.txt
+tests/test_config.py
+tests/test_pipeline.py
+tests/test_urls.py
