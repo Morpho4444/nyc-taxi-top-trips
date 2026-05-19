@@ -13,7 +13,7 @@ output : output/top_trips/year_month=YYYY-MM/part.parquet
 ## Quickstart
 
 ```bash
-git clone https://github.com/Morpho4444/tinybird.git && cd nyc-taxi-top-trips
+git clone https://github.com/Morpho4444/nyc-taxi-top-trips.git && cd nyc-taxi-top-trips
 make setup     # creates .venv, installs deps
 make test      # 17 tests, ~0.2s, no network
 make run       # processes the last 12 published months
