@@ -1,12 +1,14 @@
 """Pipeline: process one or more months of TLC data.
 
 For each month:
-  1. Compute the percentile threshold AND total trip count in a single pass.
+  1. Compute the percentile threshold, total count, and data-quality metrics
+     in a single pass over the source parquet.
   2. COPY filtered rows (trip_distance > threshold) to a partitioned parquet.
   3. Write a sidecar _stats.parquet with the threshold and counts.
+  4. Write a sidecar _data_quality.parquet with anomaly counts (no filtering).
 
-At the end, glob all _stats.parquet files into a single output/summary.parquet
-so the user has one place to look for results.
+At the end, glob all sidecars into top-level summary.parquet and
+data_quality.parquet so the user has one place to look for each.
 """
 from __future__ import annotations
 
@@ -58,6 +60,7 @@ def process_month(
     partition_dir = output_dir / "top_trips" / f"year_month={year_month}"
     out_parquet = partition_dir / "part.parquet"
     stats_parquet = partition_dir / "_stats.parquet"
+    dq_parquet = partition_dir / "_data_quality.parquet"
 
     # Idempotency: skip if both outputs already exist and we're not forcing.
     if not force and out_parquet.exists() and stats_parquet.exists():
@@ -73,29 +76,46 @@ def process_month(
     # the common case — log a warning, leave the partition dir empty, and let
     # the caller continue with the next month.
     try:
-        # 1. One-pass threshold + total. DuckDB streams the parquet from CloudFront.
-        threshold, total_trips = con.execute(
+        # 1. Compute every aggregate in one pass into a temp table. Subsequent
+        #    queries reference this table rather than re-reading the parquet,
+        #    and Python never touches the aggregate values (avoiding fragile
+        #    f-string interpolation of DB-typed values back into SQL).
+        con.execute(
             f"""
+            CREATE OR REPLACE TEMP TABLE _month_agg AS
             SELECT
-                quantile_cont(trip_distance, {percentile}) AS p_threshold,
-                COUNT(*) AS total_trips
-            FROM read_parquet('{source_url}')
+                quantile_cont(trip_distance, {percentile})            AS p_threshold,
+                COUNT(*)                                               AS total_trips,
+                SUM(CASE WHEN trip_distance IS NULL THEN 1 ELSE 0 END) AS n_null,
+                SUM(CASE WHEN trip_distance < 0    THEN 1 ELSE 0 END)  AS n_negative,
+                SUM(CASE WHEN trip_distance = 0    THEN 1 ELSE 0 END)  AS n_zero,
+                SUM(CASE WHEN trip_distance > 100  THEN 1 ELSE 0 END)  AS n_over_100mi,
+                SUM(CASE WHEN trip_distance > 1000 THEN 1 ELSE 0 END)  AS n_over_1000mi,
+                MIN(trip_distance)                                     AS min_distance,
+                MAX(trip_distance)                                     AS max_distance
+            FROM read_parquet('{source_url}');
             """
+        )
+
+        # Need threshold and total_trips on the Python side: threshold for the
+        # logger output, total_trips for the percentage calc. Everything else
+        # stays in SQL.
+        threshold, total_trips = con.execute(
+            "SELECT p_threshold, total_trips FROM _month_agg"
         ).fetchone()
 
         if threshold is None:
             logger.warning("skip %s (no rows in source)", year_month)
             return None
 
-        # 2. Filter and write. We re-read the source; in practice DuckDB + CloudFront
-        #    handle this efficiently. If this ever becomes a bottleneck, swap to a
-        #    local cache in data/raw/ (intentionally not done here to keep the MVP small).
+        # 2. Filter and write. The threshold lives in _month_agg, so we reference
+        #    it via a scalar subquery rather than interpolating its value.
         con.execute(
             f"""
             COPY (
                 SELECT *
                 FROM read_parquet('{source_url}')
-                WHERE trip_distance > {threshold}
+                WHERE trip_distance > (SELECT p_threshold FROM _month_agg)
             ) TO '{out_parquet}' (FORMAT PARQUET);
             """
         )
@@ -106,26 +126,66 @@ def process_month(
 
         elapsed = time.time() - t0
 
-        # 3. Stats sidecar. One row per processed month, also acts as the "done" marker.
+        # 3. Stats sidecar. Reads threshold and total from _month_agg; only
+        #    the Python-known values (year_month, source_url, taxi_color,
+        #    percentile, filtered_trips, elapsed) are interpolated.
+        con.execute(
+            f"""
+            COPY (
+                SELECT
+                    '{year_month}'  AS year_month,
+                    '{source_url}'  AS source_url,
+                    '{taxi_color}'  AS taxi_color,
+                    {percentile}    AS percentile,
+                    a.p_threshold   AS threshold_miles,
+                    a.total_trips   AS total_trips,
+                    {filtered_trips} AS filtered_trips,
+                    {elapsed}       AS runtime_seconds,
+                    NOW()           AS processed_at
+                FROM _month_agg a
+            ) TO '{stats_parquet}' (FORMAT PARQUET);
+            """
+        )
+
+        # 4. Data quality sidecar — reads everything from _month_agg, no
+        #    Python interpolation of aggregate values. Surfaces anomalies
+        #    (NULL/negative/zero/extreme distances) without filtering.
         con.execute(
             f"""
             COPY (
                 SELECT
                     '{year_month}' AS year_month,
-                    '{source_url}' AS source_url,
-                    '{taxi_color}' AS taxi_color,
-                    CAST({percentile} AS DOUBLE) AS percentile,
-                    CAST({threshold} AS DOUBLE) AS threshold_miles,
-                    CAST({total_trips} AS BIGINT) AS total_trips,
-                    CAST({filtered_trips} AS BIGINT) AS filtered_trips,
-                    CAST({elapsed} AS DOUBLE) AS runtime_seconds,
-                    NOW() AS processed_at
-            ) TO '{stats_parquet}' (FORMAT PARQUET);
+                    total_trips,
+                    n_null         AS n_null_distance,
+                    n_negative     AS n_negative_distance,
+                    n_zero         AS n_zero_distance,
+                    n_over_100mi,
+                    n_over_1000mi,
+                    min_distance,
+                    max_distance
+                FROM _month_agg
+            ) TO '{dq_parquet}' (FORMAT PARQUET);
             """
         )
+
+        # Fetch the data quality counts for the return dict / logging.
+        dq = con.execute(
+            """SELECT n_null, n_negative, n_zero, n_over_100mi, n_over_1000mi,
+                      min_distance, max_distance
+               FROM _month_agg"""
+        ).fetchone()
+        n_null, n_negative, n_zero, n_over_100mi, n_over_1000mi, min_distance, max_distance = dq
+
     except duckdb.IOException as e:
         logger.warning("skip %s (source not reachable: %s)", year_month, e)
-        # Don't leave a partial part.parquet around — it would confuse a re-run.
+        if out_parquet.exists():
+            out_parquet.unlink()
+        return None
+    except duckdb.Error as e:
+        # Catch any other DuckDB error (Parser, Binder, Conversion, etc.) so a
+        # single malformed month doesn't kill the whole run. Log enough detail
+        # to diagnose later, but keep going.
+        logger.error("skip %s (DuckDB error: %s: %s)", year_month, type(e).__name__, e)
         if out_parquet.exists():
             out_parquet.unlink()
         return None
@@ -141,27 +201,53 @@ def process_month(
         "total_trips": total_trips,
         "filtered_trips": filtered_trips,
         "runtime_seconds": elapsed,
+        "n_null_distance": n_null,
+        "n_negative_distance": n_negative,
+        "n_zero_distance": n_zero,
+        "n_over_100mi": n_over_100mi,
+        "n_over_1000mi": n_over_1000mi,
+        "min_distance": min_distance,
+        "max_distance": max_distance,
     }
 
 
 def build_summary(con: duckdb.DuckDBPyConnection, output_dir: Path) -> Path | None:
-    """Glob all per-partition _stats.parquet into a single summary.parquet."""
-    stats_glob = output_dir / "top_trips" / "year_month=*" / "_stats.parquet"
-    summary_path = output_dir / "summary.parquet"
-    # Check if any stats files exist
-    matches = list((output_dir / "top_trips").glob("year_month=*/_stats.parquet"))
-    if not matches:
+    """Glob per-partition sidecars into top-level summary.parquet + data_quality.parquet."""
+    top_trips = output_dir / "top_trips"
+
+    # Stats summary
+    stats_matches = list(top_trips.glob("year_month=*/_stats.parquet"))
+    summary_path: Path | None = None
+    if stats_matches:
+        stats_glob = top_trips / "year_month=*" / "_stats.parquet"
+        summary_path = output_dir / "summary.parquet"
+        con.execute(
+            f"""
+            COPY (
+                SELECT * FROM read_parquet('{stats_glob}')
+                ORDER BY year_month
+            ) TO '{summary_path}' (FORMAT PARQUET);
+            """
+        )
+        logger.info("wrote summary: %s (%d months)", summary_path, len(stats_matches))
+    else:
         logger.warning("no stats files found; skipping summary")
-        return None
-    con.execute(
-        f"""
-        COPY (
-            SELECT * FROM read_parquet('{stats_glob}')
-            ORDER BY year_month
-        ) TO '{summary_path}' (FORMAT PARQUET);
-        """
-    )
-    logger.info("wrote summary: %s (%d months)", summary_path, len(matches))
+
+    # Data quality summary (independent — older partitions may not have one)
+    dq_matches = list(top_trips.glob("year_month=*/_data_quality.parquet"))
+    if dq_matches:
+        dq_glob = top_trips / "year_month=*" / "_data_quality.parquet"
+        dq_path = output_dir / "data_quality.parquet"
+        con.execute(
+            f"""
+            COPY (
+                SELECT * FROM read_parquet('{dq_glob}')
+                ORDER BY year_month
+            ) TO '{dq_path}' (FORMAT PARQUET);
+            """
+        )
+        logger.info("wrote data_quality: %s (%d months)", dq_path, len(dq_matches))
+
     return summary_path
 
 

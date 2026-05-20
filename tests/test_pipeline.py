@@ -138,3 +138,62 @@ def test_run_full_pipeline(synthetic_parquet: Path, tmp_path: Path, monkeypatch)
     con = duckdb.connect()
     n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{summary}')").fetchone()[0]
     assert n == 3
+
+
+def test_data_quality_counts_correctly(tmp_path: Path, monkeypatch):
+    """Build a parquet with known anomalies and verify the counts match exactly."""
+    import numpy as np
+    import pandas as pd
+
+    # Deliberate composition: 100 clean, 5 zero, 3 negative, 2 NULL,
+    # 2 over 100mi, 1 over 1000mi
+    distances = (
+        list(np.linspace(0.5, 20.0, 100))   # 100 clean
+        + [0.0] * 5                          # 5 zero
+        + [-1.0, -2.0, -0.5]                 # 3 negative
+        + [None, None]                       # 2 NULL
+        + [150.0, 200.0]                     # 2 over 100mi (and counted once each)
+        + [9999.0]                           # 1 over 1000mi (also counted in over_100mi)
+    )
+    df = pd.DataFrame({"trip_distance": distances})
+    fixture = tmp_path / "dirty.parquet"
+    df.to_parquet(fixture)
+
+    monkeypatch.setattr(pipeline, "build_url", lambda ym, color: str(fixture))
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    con = duckdb.connect()
+
+    result = pipeline.process_month(con, "2024-01", 0.9, "yellow", output_dir)
+    assert result is not None
+    assert result["total_trips"] == 113   # 100 + 5 + 3 + 2 + 2 + 1
+    assert result["n_zero_distance"] == 5
+    assert result["n_negative_distance"] == 3
+    assert result["n_null_distance"] == 2
+    assert result["n_over_100mi"] == 3    # 150, 200, 9999 all > 100
+    assert result["n_over_1000mi"] == 1   # only 9999
+    assert result["max_distance"] == 9999.0
+
+    # Verify the sidecar exists and is readable
+    dq_parquet = output_dir / "top_trips" / "year_month=2024-01" / "_data_quality.parquet"
+    assert dq_parquet.exists()
+    dq_row = con.execute(f"SELECT * FROM read_parquet('{dq_parquet}')").fetchone()
+    assert dq_row is not None
+
+
+def test_build_summary_writes_data_quality_aggregate(synthetic_parquet: Path, tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(pipeline, "build_url", lambda ym, color: str(synthetic_parquet))
+    con = duckdb.connect()
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    pipeline.process_month(con, "2024-01", 0.9, "yellow", output_dir)
+    pipeline.process_month(con, "2024-02", 0.9, "yellow", output_dir)
+    pipeline.build_summary(con, output_dir)
+
+    dq_path = output_dir / "data_quality.parquet"
+    assert dq_path.exists()
+    rows = con.execute(
+        f"SELECT year_month FROM read_parquet('{dq_path}') ORDER BY year_month"
+    ).fetchall()
+    assert [r[0] for r in rows] == ["2024-01", "2024-02"]
